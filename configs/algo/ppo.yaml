@@ -1,0 +1,40 @@
+# PPO Configuration
+# ============================
+
+algorithm: ppo
+
+# Learning rates
+lr: 3.0e-4
+lr_schedule: constant  # constant, linear
+
+# PPO hyperparameters
+gamma: 0.99
+gae_lambda: 0.95
+clip_eps: 0.2
+clip_value: true
+value_clip_eps: 0.2
+
+# Loss weights
+value_loss_coef: 0.5
+entropy_coef: 0.01
+max_grad_norm: 0.5
+
+# Training parameters
+num_epochs: 10
+batch_size: 64
+normalize_advantages: true
+
+# Rollout parameters
+num_steps: 2048
+num_envs: 1
+
+# Early stopping
+target_kl: null  # null for now will change later if required
+
+# Network architecture
+network:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  use_layer_norm: false
+  use_orthogonal_init: true
+  init_std: 0.5
