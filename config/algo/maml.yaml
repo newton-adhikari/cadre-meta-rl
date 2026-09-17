@@ -1,0 +1,32 @@
+# MAML Configuration
+# =============================
+
+algorithm: maml
+
+# Meta-learning parameters
+meta_lr: 1.0e-3
+inner_lr: 0.1
+num_inner_steps: 1
+meta_batch_size: 10
+
+# Rollout parameters
+num_trajectories_per_task: 10
+max_episode_steps: 500
+
+# Policy gradient parameters
+gamma: 0.99
+gae_lambda: 0.95
+clip_eps: 0.0  # 0 for vanilla [has to be more than0 for PPO-style clipping]
+entropy_coef: 0.01
+
+# Training settings
+first_order: false  # true for FOMAML
+normalize_advantages: true
+max_grad_norm: 0.5
+
+# Network architecture
+network:
+  hidden_sizes: [256, 256]
+  activation: tanh
+  use_layer_norm: false
+  use_orthogonal_init: true
