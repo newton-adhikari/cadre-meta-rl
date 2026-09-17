@@ -517,8 +517,72 @@ def create_default_task_distribution(
 class DynamicsDistribution:
     """Samples DynamicsConfig objects from a named split of DYNAMICS_RANGES.
 
+    Parameters
+    ----------
+    split:
+        One of the keys in ``meta_rl_tb3.envs.physics.DYNAMICS_RANGES``:
+        "train", "val_iid", "ood_dyn_interp", "ood_dyn_extrap",
+        "ood_sens", "ood_comp", "nominal".
+    seed:
+        Random seed for reproducibility.
     """
 
     def __init__(self, split: str = "train", seed: Optional[int] = None):
-        pass
+        from meta_rl_tb3.envs.physics import DYNAMICS_RANGES, sample_dynamics
+        if split not in DYNAMICS_RANGES:
+            raise ValueError(
+                f"Unknown dynamics split '{split}'. "
+                f"Available: {sorted(DYNAMICS_RANGES.keys())}"
+            )
+        self.split = split
+        self.rng = np.random.RandomState(seed)
+        self._sample_fn = sample_dynamics
 
+    def sample(self):
+        """Sample one DynamicsConfig from this split."""
+        return self._sample_fn(self.split, rng=self.rng)
+
+    def sample_batch(self, n: int) -> list:
+        """Sample n DynamicsConfig objects."""
+        return [self.sample() for _ in range(n)]
+
+
+# =============================================================================
+# Fixed test-set utility  — prevents test-time data leakage
+# =============================================================================
+
+def get_fixed_test_tasks(
+    task_dist: TaskDistribution,
+    dyn_dist: Optional[DynamicsDistribution] = None,
+    n: int = 200,
+    seed: int = 0,
+) -> List[Task]:
+    """Generate a fixed, reproducible list of test tasks.
+
+    The test set is sampled ONCE using a dedicated seed that is
+    separate from the training seed.  It must never be regenerated
+    mid-experiment — call this once at the start of evaluation and
+    cache the result.
+
+    Each task optionally gets a DynamicsConfig attached so that the
+    evaluation covers diverse dynamics conditions independently of
+    training task sampling.
+
+    
+    """
+    rng = np.random.RandomState(seed)
+    # Temporarily override the distribution's RNG so we get a deterministic set
+    original_rng = task_dist.rng
+    task_dist.rng = rng
+
+    tasks = task_dist.sample_batch(n)
+
+    task_dist.rng = original_rng  # Restore
+
+    # Attach dynamics configs
+    if dyn_dist is not None:
+        dyn_list = dyn_dist.sample_batch(n)
+        for task, dyn in zip(tasks, dyn_list):
+            task.config.dynamics = dyn
+
+    return tasks

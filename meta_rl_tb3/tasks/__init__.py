@@ -12,6 +12,7 @@ from meta_rl_tb3.tasks.distributions import (
     MixedTaskDistribution,
     create_default_task_distribution,
     DynamicsDistribution,
+    get_fixed_test_tasks,
 )
 
 __all__ = [
