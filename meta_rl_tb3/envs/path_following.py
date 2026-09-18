@@ -133,6 +133,9 @@ class PathFollowingEnv(TurtleBot3Env):
         
         if path_type == PathType.STRAIGHT:
             return self._generate_straight_path()
+        elif path_type == PathType.CIRCULAR:
+            return self._generate_circular_path()
+
 
 
     def _generate_straight_path(self) -> np.ndarray:
@@ -148,6 +151,22 @@ class PathFollowingEnv(TurtleBot3Env):
             y = robot_pos[1] + distance * np.sin(robot_theta)
             waypoints.append([x, y])
             distance += 0.5
+        
+        return np.array(waypoints, dtype=np.float32)
+
+    def _generate_circular_path(self) -> np.ndarray:
+        radius = self.task_config.path_radius
+        n = self.task_config.num_waypoints
+        
+        # Center the circle in the arena
+        center_x, center_y = 0.0, 0.0
+        
+        waypoints = []
+        for i in range(n):
+            angle = 2 * np.pi * i / n
+            x = center_x + radius * np.cos(angle)
+            y = center_y + radius * np.sin(angle)
+            waypoints.append([x, y])
         
         return np.array(waypoints, dtype=np.float32)
         
