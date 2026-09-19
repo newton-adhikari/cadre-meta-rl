@@ -216,6 +216,270 @@ def train_ppo_ft_agent(
         seed=seed,
     )
 
+    # Simple env that re-samples task+dynamics on each reset
+    from meta_rl_tb3.envs.goal_reaching import GoalReachingEnv, GoalReachingConfig, FlatGoalReachingEnv
+
+    class MultiTaskEnv:
+        """Wraps distribution to re-sample task+dynamics on each reset."""
+        def __init__(self, dist, dyn_split):
+            self.dist      = dist
+            self.dyn_split = dyn_split
+            self._env      = None
+            self._build_env()
+            self.observation_space = self._env.observation_space
+            self.action_space      = self._env.action_space
+
+        def _build_env(self):
+            if self._env is not None:
+                try: self._env.close()
+                except Exception: pass
+            task = self.dist.sample()
+            task.config.dynamics = sample_dynamics(self.dyn_split)
+            self._env = task._default_env_fn()
+
+        def reset(self, **kw):
+            self._build_env()
+            return self._env.reset(**kw)
+
+        def step(self, a):
+            return self._env.step(a)
+
+        def close(self):
+            if self._env: self._env.close()
+
+        @property
+        def unwrapped(self):
+            return self._env.unwrapped
+
+    env = MultiTaskEnv(dist, DYNAMICS_SPLIT)
+    cfg = PPOConfig(
+        lr=3e-4,
+        num_steps=2048,
+        batch_size=64,
+        num_epochs=10,
+        network_config=NetworkConfig(hidden_sizes=[256, 256], activation="tanh"),
+        device=device,
+    )
+    agent = PPO(env, cfg)
+
+    total_updates = (num_iters * META_BATCH_SIZE * N_SUPPORT_EPISODES * MAX_EP_STEPS) // cfg.num_steps
+    print(f"  [PPO-FT s={seed}] training {total_updates} updates "
+          f"(≈ CADRE compute budget)...")
+
+    for upd in range(1, total_updates + 1):
+        m = agent.train_step()
+        if upd % max(1, total_updates // 10) == 0:
+            print(f"  [PPO-FT s={seed}] update {upd}/{total_updates} | "
+                  f"reward={m['mean_reward']:+.2f}")
+
+    env.close()
+    return agent
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def _collect_adaptation_episode(
+    env,
+    policy_fn,
+    max_steps: int = MAX_EP_STEPS,
+) -> EpisodeResult:
+    """Run one evaluation episode with the given policy callable.
+
+    policy_fn(obs_np) → action_np
+    """
+    obs, info = env.reset()
+    if not isinstance(obs, np.ndarray):
+        obs = np.concatenate([v.flatten() for v in obs.values()])
+
+    total_reward = 0.0
+    any_collision = False
+    n_steps = 0
+
+    for _ in range(max_steps):
+        action = policy_fn(obs)
+        obs, rew, term, trunc, info = env.step(action)
+        if not isinstance(obs, np.ndarray):
+            obs = np.concatenate([v.flatten() for v in obs.values()])
+        total_reward += rew
+        n_steps += 1
+        if info.get("collision", False):
+            any_collision = True
+        if term or trunc:
+            break
+
+    success     = bool(info.get("is_success", False))
+    final_dist  = float(info.get("distance_to_goal", float("nan")))
+    return EpisodeResult(
+        success=success,
+        collision=any_collision,
+        n_steps=n_steps,
+        final_dist=final_dist,
+        total_reward=total_reward,
+    )
+
+
+def evaluate_cadre_at_budget(
+    agent: CADRE,
+    test_tasks: list,
+    budget_steps: int,
+    n_eval_per_task: int = N_EVAL_EPISODES_PER_TASK,
+    method_label: str = "cadre",
+    seed: int = 0,
+    dyn_split: str = DYNAMICS_SPLIT,
+) -> List[EpisodeResult]:
+    """Evaluate CADRE/FOMAML at a fixed adaptation budget (environment steps)."""
+    import torch
+    from collections import OrderedDict, deque
+
+    n_adapt = budget_steps // max(1, MAX_EP_STEPS)
+
+    episodes: List[EpisodeResult] = []
+
+    for task in test_tasks:
+        task.config.dynamics = sample_dynamics(dyn_split)
+        env = task._default_env_fn()
+        try:
+            # ──  clone meta-params ─────────────────────────────────
+            params = OrderedDict(
+                (name, param.clone())
+                for name, param in agent.actor_critic.named_parameters()
+            )
+            enc_params = (dict(agent.encoder.named_parameters())
+                          if agent.encoder is not None else {})
+
+            # ──  adaptation (exactly n_adapt episodes) ─────────────
+            K         = agent.config.context_encoder_config.context_window
+            trans_buf = deque(maxlen=K)
+
+            for _ in range(n_adapt):
+                obs_raw, _ = env.reset()
+                obs = agent._flatten_obs(obs_raw)
+                rollout_obs, rollout_acts, rollout_rews = [], [], []
+                rollout_dones, rollout_vals = [], []
+                done = False; step = 0
+
+                while not done and step < MAX_EP_STEPS:
+                    with torch.no_grad():
+                        z    = agent._encode_context(trans_buf, enc_params)
+                        z_np = z.cpu().numpy().squeeze(0)
+                        p_obs = (np.concatenate([obs, z_np])
+                                 if agent.context_dim > 0 else obs)
+                        obs_t  = torch.from_numpy(p_obs).float().unsqueeze(0).to(agent.device)
+                        act_t, _, _, val_t = agent._forward_policy(obs_t, params)
+                    act_np = act_t.cpu().numpy().squeeze(0)
+                    next_raw, rew, term, trunc, _ = env.step(act_np)
+                    done    = bool(term or trunc)
+                    next_obs = agent._flatten_obs(next_raw)
+                    rollout_obs.append(obs.copy()); rollout_acts.append(act_np.copy())
+                    rollout_rews.append(float(rew)); rollout_dones.append(1.0 if done else 0.0)
+                    rollout_vals.append(val_t.cpu().item())
+                    trans_buf.append(agent._build_transition(obs, act_np, rew, next_obs))
+                    obs = next_obs; step += 1
+
+                if agent.config.num_inner_steps > 0:
+                    rollout = {
+                        "obs_np":     np.array(rollout_obs,   dtype=np.float32),
+                        "actions_np": np.array(rollout_acts,  dtype=np.float32),
+                        "context_np": np.zeros((len(rollout_obs), agent.context_dim), dtype=np.float32),
+                        "rewards":    np.array(rollout_rews,  dtype=np.float32),
+                        "dones":      np.array(rollout_dones, dtype=np.float32),
+                        "values":     np.array(rollout_vals,  dtype=np.float32),
+                    }
+                    params = agent._inner_update(params, rollout, create_graph=False)
+
+            # ── evaluate n_eval_per_task fresh episodes ───────────
+            def policy_fn(obs_np):
+                with torch.no_grad():
+                    z    = agent._encode_context(trans_buf, enc_params)
+                    z_np = z.cpu().numpy().squeeze(0)
+                    p_obs = (np.concatenate([obs_np, z_np])
+                             if agent.context_dim > 0 else obs_np)
+                    obs_t  = torch.from_numpy(p_obs).float().unsqueeze(0).to(agent.device)
+                    act_t, _, _, _ = agent._forward_policy(obs_t, params)
+                return act_t.cpu().numpy().squeeze(0)
+
+            for _ in range(n_eval_per_task):
+                ep = _collect_adaptation_episode(env, policy_fn)
+                ep.method         = method_label
+                ep.seed           = seed
+                ep.budget         = budget_steps
+                ep.task_id        = task.task_id
+                ep.dynamics_split = dyn_split
+                episodes.append(ep)
+
+        finally:
+            env.close()
+
+    return episodes
+
+
+def evaluate_ppo_ft_at_budget(
+    agent: PPO,
+    test_tasks: list,
+    budget_steps: int,
+    n_eval_per_task: int = N_EVAL_EPISODES_PER_TASK,
+    seed: int = 0,
+    dyn_split: str = DYNAMICS_SPLIT,
+) -> List[EpisodeResult]:
+    """Evaluate PPO-FT at a fixed adaptation budget.
+
+    Creates a copy of the pretrained weights, fine-tunes on budget_steps
+    steps of experience from the test task, then evaluates.
+    """
+    import copy
+    import torch
+
+    episodes: List[EpisodeResult] = []
+
+    for task in test_tasks:
+        task.config.dynamics = sample_dynamics(dyn_split)
+        env = task._default_env_fn()
+
+        try:
+            # Deep-copy so we always start from the pretrained init
+            ft_agent = copy.deepcopy(agent)
+            ft_agent.env = env
+            # Reset the agent's internal obs to the new env's initial obs
+            obs_init, _ = env.reset()
+            if not isinstance(obs_init, np.ndarray):
+                obs_init = np.concatenate([v.flatten() for v in obs_init.values()])
+            ft_agent._last_obs = obs_init
+            pre_train_steps = ft_agent.total_steps  # save baseline for delta tracking
+
+            steps_done = 0
+            while steps_done < budget_steps:
+                old_steps = ft_agent.total_steps
+                ft_agent.collect_rollouts()
+                collected = ft_agent.total_steps - old_steps
+                if collected == 0:
+                    break
+                ft_agent.update()
+                steps_done += (ft_agent.total_steps - pre_train_steps) - steps_done
+                if steps_done >= budget_steps:
+                    break
+
+            def policy_fn(obs_np):
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(obs_np).float().unsqueeze(0).to(ft_agent.device)
+                    act   = ft_agent.actor_critic.get_action(obs_t, deterministic=True)
+                return act.cpu().numpy().squeeze(0)
+
+            for _ in range(n_eval_per_task):
+                ep = _collect_adaptation_episode(env, policy_fn)
+                ep.method         = "ppo_ft"
+                ep.seed           = seed
+                ep.budget         = budget_steps
+                ep.task_id        = task.task_id
+                ep.dynamics_split = dyn_split
+                episodes.append(ep)
+
+        finally:
+            env.close()
+
+    return episodes
+
 def main():
     pass
 
