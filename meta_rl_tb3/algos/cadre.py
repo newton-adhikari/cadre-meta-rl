@@ -539,3 +539,367 @@ class CADRE:
                 updated[name] = param - self.config.inner_lr * g
 
         return updated
+
+    # ------------------------------------------------------------------
+    # Public: meta_update (training)
+    # ------------------------------------------------------------------
+
+    def meta_update(
+        self,
+        task_batch: Union[list, Any],
+    ) -> Dict[str, float]:
+        """One meta-update across a batch of tasks."""
+        self.actor_critic.train()
+        if self.encoder is not None:
+            self.encoder.train()
+
+        # Resolve tasks to callables
+        tasks = list(task_batch) if hasattr(task_batch, "__iter__") else [task_batch]
+
+        create_inner_graph = not self.config.first_order
+
+        meta_loss         = torch.tensor(0.0, device=self.device)
+        all_pre_rewards:  List[float] = []
+        all_post_rewards: List[float] = []
+        per_task_improvements: List[float] = []
+        all_ep_lengths:   List[float] = []
+        all_entropies:    List[float] = []
+
+        for task_fn in tasks:
+            env = task_fn() if callable(task_fn) else task_fn
+
+            try:
+                # ── Clone policy params (keeps graph connection) ─────────
+                policy_params = OrderedDict(
+                    (name, param.clone())
+                    for name, param in self.actor_critic.named_parameters()
+                )
+                # Encoder params are NOT inner-loop adapted
+                encoder_params = dict(self.encoder.named_parameters()) \
+                    if self.encoder is not None else {}
+
+                # ── Support rollout ──────────────────────────────────────
+                support = self._collect_rollout(
+                    env, policy_params, encoder_params,
+                    self.config.num_support_episodes,
+                )
+
+                # ── Inner loop ───────────────────────────────────────────
+                adapted = policy_params
+                for _ in range(self.config.num_inner_steps):
+                    adapted = self._inner_update(
+                        adapted, support, create_graph=create_inner_graph
+                    )
+
+                # ── Query rollout with adapted params ────────────────────
+                query = self._collect_rollout(
+                    env, adapted, encoder_params,
+                    self.config.num_query_episodes,
+                )
+
+                # ── Query (meta) loss ────────────────────────────────────
+                q_adv, _ = self._compute_advantages(
+                    query["rewards"], query["values"], query["dones"]
+                )
+
+                # For the outer loss, get a differentiable context from the
+                # support transitions so φ receives meta-gradients.
+                # Use the FULL support sequence in one GRU call (O(N_support_steps))
+                # rather than a per-timestep causal recompute (O(N² ) previously).
+                # This is a valid approximation: the context used at eval time is
+                # the support context, not a per-step causal context.
+                if self.encoder is not None:
+                    # Encode support transitions once; broadcast to query batch size
+                    n_query   = len(query["obs_np"])
+                    query_ctx = self._compute_episode_context_with_grad(
+                        support, encoder_params, n_broadcast=n_query
+                    )
+                    task_loss = self._pg_loss_with_context_tensor(
+                        adapted, query, q_adv, query_ctx
+                    )
+                else:
+                    task_loss = self._pg_loss(adapted, query, q_adv)
+
+                meta_loss = meta_loss + task_loss / len(tasks)
+
+                # ── Metrics ──────────────────────────────────────────────
+                pre  = float(support["rewards"].sum()) / self.config.num_support_episodes
+                post = float(query["rewards"].sum())   / self.config.num_query_episodes
+                all_pre_rewards.append(pre)
+                all_post_rewards.append(post)
+                per_task_improvements.append(post - pre)
+                ep_len = (len(support["rewards"]) + len(query["rewards"])) / (
+                    2.0 * max(self.config.num_support_episodes,
+                              self.config.num_query_episodes)
+                )
+                all_ep_lengths.append(ep_len)
+
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(
+                        np.concatenate([query["obs_np"], query["context_np"]], axis=-1)
+                        if self.context_dim > 0 else query["obs_np"]
+                    ).float().to(self.device)
+                    acts_t = torch.from_numpy(query["actions_np"]).float().to(self.device)
+                    ap = {k[len("actor."):]: v for k, v in adapted.items()
+                          if k.startswith("actor.")}
+                    feats = obs_t
+                    if self.actor_critic.share_features and self.actor_critic.feature_net:
+                        fp = {k[len("feature_net."):]: v for k, v in adapted.items()
+                              if k.startswith("feature_net.")}
+                        feats = functional_call(self.actor_critic.feature_net, fp, (obs_t,))
+                    mean, log_std = functional_call(
+                        self.actor_critic.actor, ap, (feats,)
+                    )
+                    ent = torch.distributions.Normal(
+                        mean, torch.exp(log_std)
+                    ).entropy().sum(-1).mean()
+                    all_entropies.append(ent.item())
+
+            finally:
+                env.close()
+
+        # ── Meta-gradient update ─────────────────────────────────────────
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+
+        all_params = list(self.actor_critic.parameters())
+        if self.encoder is not None:
+            all_params += list(self.encoder.parameters())
+        if self.config.max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(all_params, self.config.max_grad_norm)
+
+        self.meta_optimizer.step()
+        self.total_meta_iterations += 1
+
+        return {
+            "meta_loss":                    meta_loss.item(),
+            "pre_adaptation_reward":        float(np.mean(all_pre_rewards)),
+            "post_adaptation_reward":       float(np.mean(all_post_rewards)),
+            "pre_adaptation_reward_std":    float(np.std(all_pre_rewards)),
+            "post_adaptation_reward_std":   float(np.std(all_post_rewards)),
+            "adaptation_improvement":       float(np.mean(per_task_improvements)),
+            "adaptation_improvement_median": float(np.median(per_task_improvements)),
+            "fraction_tasks_improved":      float(np.mean([i > 0 for i in per_task_improvements])),
+            "mean_episode_length":          float(np.mean(all_ep_lengths)),
+            "mean_entropy":                 float(np.mean(all_entropies)),
+            "total_env_steps":              self.total_env_steps,
+            "meta_iteration":               self.total_meta_iterations,
+            "per_task_improvements":        per_task_improvements,
+        }
+
+    # ------------------------------------------------------------------
+    # Re-encode context with gradient (for meta-loss)
+    # ------------------------------------------------------------------
+
+    def _compute_episode_context_with_grad(
+        self,
+        rollout:        Dict[str, Any],
+        encoder_params: Dict[str, torch.Tensor],
+        n_broadcast:    int = None,
+    ) -> torch.Tensor:
+        """Encode ALL support transitions in one GRU call and broadcast."""
+        trans_dim = self.encoder.transition_dim
+
+        obs_np  = rollout["obs_np"]
+        acts_np = rollout["actions_np"]
+        rews_np = rollout["rewards"]
+
+        next_obs_np          = np.empty_like(obs_np)
+        next_obs_np[:-1]     = obs_np[1:]
+        next_obs_np[-1]      = obs_np[-1]
+
+        transitions_np = np.concatenate([
+            obs_np, acts_np, rews_np[:, None], next_obs_np,
+        ], axis=-1).astype(np.float32)
+
+        # Single GRU call over the full support sequence
+        t_full = torch.from_numpy(transitions_np).float().to(self.device).unsqueeze(0)
+
+        enc_t_params = {k[len("transition_encoder."):]: v
+                        for k, v in encoder_params.items()
+                        if k.startswith("transition_encoder.")}
+        encoded = functional_call(self.encoder.transition_encoder, enc_t_params, (t_full,))
+
+        gru_params = {k[len("gru."):]: v
+                      for k, v in encoder_params.items()
+                      if k.startswith("gru.")}
+        gru_out, _ = functional_call(self.encoder.gru, gru_params, (encoded,))
+
+        head_params = {k[len("task_head."):]: v
+                       for k, v in encoder_params.items()
+                       if k.startswith("task_head.")}
+        final      = gru_out[:, -1, :]             # (1, gru_hidden)
+        z          = functional_call(self.encoder.task_head, head_params, (final,))
+        # (1, context_dim)
+
+        # Broadcast to the requested batch size
+        n = n_broadcast if n_broadcast is not None else len(rollout["obs_np"])
+        return z.expand(n, -1)  # (n, context_dim)
+
+    def _recompute_context_with_grad(
+        self,
+        rollout:        Dict[str, Any],
+        encoder_params: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Re-encode stored transitions through the encoder WITH gradients."""
+        N         = len(rollout["obs_np"])
+        trans_dim = self.encoder.transition_dim
+
+        obs_np  = rollout["obs_np"]
+        acts_np = rollout["actions_np"]
+        rews_np = rollout["rewards"]
+
+        # Reconstruct next_obs (shift by 1; last row repeated)
+        next_obs_np          = np.empty_like(obs_np)
+        next_obs_np[:-1]     = obs_np[1:]
+        next_obs_np[-1]      = obs_np[-1]
+
+        # Build full transition sequence: (N, trans_dim)
+        transitions_np = np.concatenate([
+            obs_np, acts_np, rews_np[:, None], next_obs_np,
+        ], axis=-1).astype(np.float32)
+
+        # Run encoder over entire sequence in one batched call (batch=1, seq=N)
+        t_full = torch.from_numpy(transitions_np).float().to(self.device).unsqueeze(0)
+        # encoder forward: (1, N, context_dim)
+        # We need the GRU's per-step outputs — so we call transition_encoder + GRU
+        # manually to get all outputs rather than just the final one.
+
+        # -- Run transition MLP over all N steps --
+        enc_t_params = {
+            k[len("transition_encoder."):]: v
+            for k, v in encoder_params.items()
+            if k.startswith("transition_encoder.")
+        }
+        encoded = functional_call(
+            self.encoder.transition_encoder, enc_t_params, (t_full,)
+        )  # (1, N, gru_hidden)
+
+        gru_params = {
+            k[len("gru."):]: v
+            for k, v in encoder_params.items()
+            if k.startswith("gru.")
+        }
+        gru_out, _ = functional_call(
+            self.encoder.gru, gru_params, (encoded,)
+        )  # (1, N, gru_hidden)
+
+        head_params = {
+            k[len("task_head."):]: v
+            for k, v in encoder_params.items()
+            if k.startswith("task_head.")
+        }
+        # task_head maps each timestep's GRU output → context
+        # Shape: (1, N, gru_hidden) → (1*N, gru_hidden) → head → (N, context_dim)
+        gru_flat  = gru_out.squeeze(0)          # (N, gru_hidden)
+        z_all     = functional_call(
+            self.encoder.task_head, head_params, (gru_flat,)
+        )  # (N, context_dim)
+
+        # Causal shift: context at step t = output after seeing transitions 0..t-1.
+        # GRU output at position t-1 has seen transitions 0..t-1.
+        # For t=0 (no history) we use zeros.
+        zero_ctx  = torch.zeros(1, self.context_dim, device=self.device)
+        if N == 1:
+            return zero_ctx
+
+        # z_all[i] = context after transition i; use z_all[i-1] for step i.
+        # Step 0 gets zero context; steps 1..N-1 get z_all[0..N-2].
+        causal_ctx = torch.cat([zero_ctx, z_all[:-1]], dim=0)  # (N, context_dim)
+        return causal_ctx
+
+    def _pg_loss_with_context_tensor(
+        self,
+        policy_params: Dict[str, torch.Tensor],
+        rollout:       Dict[str, Any],
+        advantages:    torch.Tensor,
+        context_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """PG loss using a differentiable context tensor (for meta-gradient)."""
+        obs_t  = torch.from_numpy(rollout["obs_np"]).float().to(self.device)
+        acts_t = torch.from_numpy(rollout["actions_np"]).float().to(self.device)
+
+        # Concatenate obs with differentiable context
+        combined = torch.cat([obs_t, context_tensor], dim=-1)
+
+        actor_params = {
+            k[len("actor."):]: v
+            for k, v in policy_params.items()
+            if k.startswith("actor.")
+        }
+        feat_params = {
+            k[len("feature_net."):]: v
+            for k, v in policy_params.items()
+            if k.startswith("feature_net.")
+        }
+
+        if self.actor_critic.share_features and feat_params:
+            features = functional_call(
+                self.actor_critic.feature_net, feat_params, (combined,)
+            )
+        else:
+            features = combined
+
+        mean, log_std = functional_call(
+            self.actor_critic.actor, actor_params, (features,)
+        )
+
+        std  = torch.exp(log_std)
+        dist = torch.distributions.Normal(mean, std)
+        acts_c  = acts_t.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        raw     = torch.atanh(acts_c)
+        lprobs  = dist.log_prob(raw).sum(-1)
+        lprobs -= torch.log(1.0 - acts_c.pow(2) + 1e-6).sum(-1)
+        entropy = dist.entropy().sum(-1)
+
+        return -(lprobs * advantages).mean() - self.config.entropy_coef * entropy.mean()
+
+    # ------------------------------------------------------------------
+    # Public: adapt (test time)
+    # ------------------------------------------------------------------
+
+    def adapt(
+        self,
+        env:       gym.Env,
+        num_steps: Optional[int] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], deque]:
+        """Adapt the meta-policy to a specific task.
+
+        Returns
+        -------
+        adapted_params: Dict of adapted policy parameters.
+        trans_buffer:   Deque of all transitions collected during adaptation
+                        (useful for context computation after adaptation).
+        """
+        num_steps = num_steps if num_steps is not None else self.config.num_inner_steps
+        policy_params = OrderedDict(
+            (name, param.clone())
+            for name, param in self.actor_critic.named_parameters()
+        )
+        encoder_params = dict(self.encoder.named_parameters()) \
+            if self.encoder is not None else {}
+
+        all_trans: deque = deque(
+            maxlen=self.config.context_encoder_config.context_window
+        )
+
+        for _ in range(num_steps):
+            rollout = self._collect_rollout(
+                env, policy_params, encoder_params,
+                self.config.num_support_episodes,
+            )
+            policy_params = self._inner_update(
+                policy_params, rollout, create_graph=False
+            )
+            # Accumulate transitions for context
+            trans = np.concatenate([
+                rollout["obs_np"], rollout["actions_np"],
+                rollout["rewards"][:, None],
+                np.roll(rollout["obs_np"], -1, axis=0),
+            ], axis=-1)
+            for t in trans:
+                all_trans.append(t)
+
+        return policy_params, all_trans
+
+    
