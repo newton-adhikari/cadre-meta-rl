@@ -902,4 +902,94 @@ class CADRE:
 
         return policy_params, all_trans
 
-    
+    # ------------------------------------------------------------------
+    # Public: evaluate_adaptation
+    # ------------------------------------------------------------------
+
+    def evaluate_adaptation(
+        self,
+        env:                  gym.Env,
+        num_adaptation_steps: Optional[List[int]] = None,
+        num_eval_episodes:    int = 5,
+    ) -> Dict[str, float]:
+        """Evaluate at several inner-step counts (same API as MAML)."""
+        if num_adaptation_steps is None:
+            num_adaptation_steps = [0, 1, 3, 5, 10]
+
+        results: Dict[str, float] = {}
+
+        for k in sorted(num_adaptation_steps):
+            params = OrderedDict(
+                (name, param.clone())
+                for name, param in self.actor_critic.named_parameters()
+            )
+            enc_params = dict(self.encoder.named_parameters()) \
+                if self.encoder is not None else {}
+
+            for _ in range(k):
+                rollout = self._collect_rollout(
+                    env, params, enc_params,
+                    self.config.num_support_episodes,
+                )
+                params = self._inner_update(params, rollout, create_graph=False)
+
+            # Evaluate
+            rewards = []
+            for _ in range(num_eval_episodes):
+                obs_raw, _ = env.reset()
+                obs = self._flatten_obs(obs_raw)
+                trans_buf: deque = deque(maxlen=self.config.context_encoder_config.context_window)
+                ep_reward = 0.0
+                done = False
+                step = 0
+
+                while not done and step < self.config.max_episode_steps:
+                    with torch.no_grad():
+                        z = self._encode_context(trans_buf, enc_params)
+                        z_np = z.cpu().numpy().squeeze(0)
+                        p_obs = np.concatenate([obs, z_np]) if self.context_dim > 0 else obs
+                        obs_t = torch.from_numpy(p_obs).float().unsqueeze(0).to(self.device)
+                        act_t, _, _, _ = self._forward_policy(obs_t, params)
+                    act_np = act_t.cpu().numpy().squeeze(0)
+                    next_raw, rew, term, trunc, _ = env.step(act_np)
+                    done = bool(term or trunc)
+                    next_obs = self._flatten_obs(next_raw)
+                    trans_buf.append(
+                        self._build_transition(obs, act_np, rew, next_obs)
+                    )
+                    obs = next_obs
+                    ep_reward += rew
+                    step += 1
+
+                rewards.append(ep_reward)
+
+            results[f"reward_at_step_{k}"] = float(np.mean(rewards))
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Save checkpoint."""
+        payload = {
+            "actor_critic_state_dict": self.actor_critic.state_dict(),
+            "meta_optimizer_state_dict": self.meta_optimizer.state_dict(),
+            "total_meta_iterations": self.total_meta_iterations,
+            "total_env_steps": self.total_env_steps,
+            "config": self.config,
+        }
+        if self.encoder is not None:
+            payload["encoder_state_dict"] = self.encoder.state_dict()
+        torch.save(payload, path)
+
+    def load(self, path: str) -> None:
+        """Load checkpoint."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
+        if self.encoder is not None and "encoder_state_dict" in ckpt:
+            self.encoder.load_state_dict(ckpt["encoder_state_dict"])
+        self.meta_optimizer.load_state_dict(ckpt["meta_optimizer_state_dict"])
+        self.total_meta_iterations = ckpt["total_meta_iterations"]
+        self.total_env_steps       = ckpt["total_env_steps"]
