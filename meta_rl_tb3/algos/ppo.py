@@ -96,3 +96,144 @@ class PPOConfig:
     seed: int = 42
     device: str = "auto"
 
+
+class RolloutBuffer:
+    """Buffer for storing rollout data.
+    
+    Stores transitions from environment interactions for PPO updates.
+    Handles advantage computation using GAE.
+    
+    """
+    
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        buffer_size: int,
+        device: torch.device,
+        num_envs: int = 1,
+    ):
+        """Initialize rollout buffer."""
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.buffer_size = buffer_size
+        self.device = device
+        self.num_envs = num_envs
+        
+        # Storage
+        self.observations = np.zeros((buffer_size, num_envs, obs_dim), dtype=np.float32)
+        self.actions = np.zeros((buffer_size, num_envs, action_dim), dtype=np.float32)
+        self.rewards = np.zeros((buffer_size, num_envs), dtype=np.float32)
+        self.dones = np.zeros((buffer_size, num_envs), dtype=np.float32)
+        self.values = np.zeros((buffer_size, num_envs), dtype=np.float32)
+        self.log_probs = np.zeros((buffer_size, num_envs), dtype=np.float32)
+        
+        # Computed quantities
+        self.advantages = np.zeros((buffer_size, num_envs), dtype=np.float32)
+        self.returns = np.zeros((buffer_size, num_envs), dtype=np.float32)
+        
+        self.pos = 0
+        self.full = False
+    
+    def reset(self) -> None:
+        """Reset the buffer."""
+        self.pos = 0
+        self.full = False
+    
+    def add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: float,
+        done: bool,
+        value: float,
+        log_prob: float,
+    ) -> None:
+        """Add a transition to the buffer."""
+        self.observations[self.pos] = obs
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.dones[self.pos] = done
+        self.values[self.pos] = value
+        self.log_probs[self.pos] = log_prob
+        
+        self.pos += 1
+        if self.pos >= self.buffer_size:
+            self.full = True
+    
+    def compute_returns_and_advantages(
+        self,
+        last_value: np.ndarray,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+    ) -> None:
+        """Compute returns and advantages using GAE."""
+        last_gae = 0
+        buffer_len = self.pos if not self.full else self.buffer_size
+        
+        for t in reversed(range(buffer_len)):
+            if t == buffer_len - 1:
+                # At the last collected step, bootstrap from last_value only if
+                # that step did NOT end the episode.
+                next_non_terminal = 1.0 - self.dones[t]
+                next_value = last_value * next_non_terminal
+            else:
+                # For every other step, mask the next value by whether the
+                # current step terminated the episode.
+                next_non_terminal = 1.0 - self.dones[t]
+                next_value = self.values[t + 1] * next_non_terminal
+            
+            # TD error
+            delta = (
+                self.rewards[t] 
+                + gamma * next_value
+                - self.values[t]
+            )
+            
+            # GAE — mask the carry-over advantage by the same done flag
+            last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+            self.advantages[t] = last_gae
+        
+        # Returns = advantages + values
+        self.returns = self.advantages + self.values
+    
+    def get_batches(
+        self,
+        batch_size: int,
+        shuffle: bool = True,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Get mini-batches for training."""
+        buffer_len = self.pos if not self.full else self.buffer_size
+        
+        # Flatten data across environments
+        obs = self.observations[:buffer_len].reshape(-1, self.obs_dim)
+        actions = self.actions[:buffer_len].reshape(-1, self.action_dim)
+        values = self.values[:buffer_len].reshape(-1)
+        log_probs = self.log_probs[:buffer_len].reshape(-1)
+        advantages = self.advantages[:buffer_len].reshape(-1)
+        returns = self.returns[:buffer_len].reshape(-1)
+        
+        total_size = len(obs)
+        indices = np.arange(total_size)
+        
+        if shuffle:
+            np.random.shuffle(indices)
+        
+        # Generate batches
+        batches = []
+        for start in range(0, total_size, batch_size):
+            end = min(start + batch_size, total_size)
+            batch_indices = indices[start:end]
+            
+            batch = {
+                "observations": torch.from_numpy(obs[batch_indices]).to(self.device),
+                "actions": torch.from_numpy(actions[batch_indices]).to(self.device),
+                "old_values": torch.from_numpy(values[batch_indices]).to(self.device),
+                "old_log_probs": torch.from_numpy(log_probs[batch_indices]).to(self.device),
+                "advantages": torch.from_numpy(advantages[batch_indices]).to(self.device),
+                "returns": torch.from_numpy(returns[batch_indices]).to(self.device),
+            }
+            batches.append(batch)
+        
+        return batches
+
