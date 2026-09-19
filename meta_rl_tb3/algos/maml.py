@@ -28,6 +28,141 @@ from meta_rl_tb3.algos.ppo import RolloutBuffer  # kept for API compatibility
 
 
 # ---------------------------------------------------------------------------
+# Module-level worker for data-parallel collection.
+# ---------------------------------------------------------------------------
+
+def _collect_task_data_worker(args: tuple) -> dict:
+    """Collect one task's rollout data in a subprocess (data-only, no gradients).
+
+    This function is intentionally NOT called from ``MAML.meta_update``.
+    It exists so external callers that need cheap parallelism for large-scale
+    rollout collection can reuse the environment/policy machinery.
+
+    Returns plain numpy dicts — no tensors, no gradient graph.
+    """
+    task_fn, param_dict_cpu, config = args
+
+    device = torch.device("cpu")
+    from meta_rl_tb3.algos.networks import ActorCritic
+
+    # Infer dims from param names
+    obs_dim = next(v.shape[0] for k, v in param_dict_cpu.items()
+                   if "actor.mean_net.network.0.weight" in k)
+    action_dim = 2  # default; override from log_std if present
+    for k, v in param_dict_cpu.items():
+        if "actor.log_std" in k:
+            action_dim = v.shape[0]
+            break
+
+    actor_critic = ActorCritic(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        hidden_sizes=config.network_config.hidden_sizes,
+        activation=config.network_config.activation,
+    ).to(device)
+
+    params = OrderedDict(
+        (k, torch.tensor(v, dtype=torch.float32, device=device))
+        for k, v in param_dict_cpu.items()
+    )
+
+    def flatten_obs(obs):
+        if isinstance(obs, dict):
+            return np.concatenate([v.flatten() for v in obs.values()])
+        return np.asarray(obs).flatten()
+
+    def collect_trajectories(env, p, n_traj):
+        max_steps = config.max_episode_steps
+        all_obs, all_acts, all_rews, all_dones, all_lp, all_vals = (
+            [] for _ in range(6)
+        )
+        for _ in range(n_traj):
+            obs_raw, _ = env.reset()
+            obs = flatten_obs(obs_raw)
+            done = False
+            step = 0
+            while not done and step < max_steps:
+                obs_t = torch.from_numpy(obs).float().unsqueeze(0)
+                with torch.no_grad():
+                    a_t, lp_t, _, v_t = functional_call(actor_critic, p, (obs_t,))
+                a = a_t.squeeze(0).numpy()
+                next_raw, rew, term, trunc, _ = env.step(a)
+                done = term or trunc
+                all_obs.append(obs.copy())
+                all_acts.append(a)
+                all_rews.append(float(rew))
+                all_dones.append(float(done))
+                all_lp.append(float(lp_t.item()))
+                all_vals.append(float(v_t.item()))
+                obs = flatten_obs(next_raw)
+                step += 1
+        return {
+            "observations":   np.array(all_obs,   dtype=np.float32),
+            "actions":        np.array(all_acts,  dtype=np.float32),
+            "rewards":        np.array(all_rews,  dtype=np.float32),
+            "dones":          np.array(all_dones, dtype=np.float32),
+            "old_log_probs":  np.array(all_lp,    dtype=np.float32),
+            "values":         np.array(all_vals,  dtype=np.float32),
+        }
+
+    def compute_adv_returns(rewards, values, dones, gamma, lam):
+        adv = np.zeros_like(rewards)
+        last_gae = 0.0
+        for t in reversed(range(len(rewards))):
+            nv = 0.0 if t == len(rewards) - 1 else values[t + 1]
+            nt = 0.0 if t == len(rewards) - 1 else 1.0 - dones[t]
+            delta = rewards[t] + gamma * nv * nt - values[t]
+            adv[t] = last_gae = delta + gamma * lam * nt * last_gae
+        std = adv.std()
+        if np.isfinite(std) and std > 1e-8:
+            adv = (adv - adv.mean()) / (std + 1e-8)
+        return adv
+
+    def inner_update_numpy(p, data):
+        adv = compute_adv_returns(
+            data["rewards"], data["values"], data["dones"],
+            config.gamma, config.gae_lambda,
+        )
+        adv_t  = torch.from_numpy(adv)
+        obs_t  = torch.from_numpy(data["observations"])
+        acts_t = torch.from_numpy(data["actions"])
+        ap = {k[len("actor."):]: v for k, v in p.items() if k.startswith("actor.")}
+        mean, log_std = functional_call(actor_critic.actor, ap, (obs_t,))
+        std_t = torch.exp(log_std)
+        dist  = torch.distributions.Normal(mean, std_t)
+        acts_c = acts_t.clamp(-1 + 1e-6, 1 - 1e-6)
+        raw    = torch.atanh(acts_c)
+        lp     = dist.log_prob(raw).sum(-1) - torch.log(1 - acts_c.pow(2) + 1e-6).sum(-1)
+        ent    = dist.entropy().sum(-1)
+        loss   = -(lp * adv_t).mean() - config.entropy_coef * ent.mean()
+        grads  = torch.autograd.grad(loss, p.values(), allow_unused=True)
+        _CLIP  = 10.0
+        new_p  = OrderedDict()
+        for (name, param), grad in zip(p.items(), grads):
+            if grad is None:
+                new_p[name] = param
+            else:
+                new_p[name] = param - config.inner_lr * torch.clamp(grad, -_CLIP, _CLIP)
+        return new_p
+
+    env = task_fn()
+    try:
+        pre_data = collect_trajectories(env, params, config.num_trajectories_per_task)
+        adapted  = OrderedDict((k, v.clone().detach()) for k, v in params.items())
+        for _ in range(config.num_inner_steps):
+            adapted = inner_update_numpy(adapted, pre_data)
+        post_data = collect_trajectories(env, adapted, config.num_trajectories_per_task)
+    finally:
+        env.close()
+
+    return {
+        "pre_data":      pre_data,
+        "post_data":     post_data,
+        "adapted_params": {k: v.detach().numpy() for k, v in adapted.items()},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -112,6 +247,27 @@ class MAMLConfig:
     num_workers:              int          = 0   # kept for API compat; unused in gradient path
 
 
+# ---------------------------------------------------------------------------
+# TaskBatch helper
+# ---------------------------------------------------------------------------
+
+class TaskBatch:
+    """Wraps a list of task callables for meta-training."""
+
+    def __init__(self, tasks: List[Any]):
+        self.tasks = list(tasks)
+        self.size  = len(self.tasks)
+
+    def __iter__(self):
+        return iter(self.tasks)
+
+    def __len__(self):
+        return self.size
+
+
+# ---------------------------------------------------------------------------
+# MAML
+# ---------------------------------------------------------------------------
 
 class MAML:
     """Model-Agnostic Meta-Learning for RL.
@@ -488,5 +644,223 @@ class MAML:
 
     def meta_update(
         self,
+        task_batch: Union[TaskBatch, List],
     ) -> Dict[str, float]:
-        pass
+        """One meta-update across a batch of tasks.
+
+        The full computation graph is maintained in-process:
+
+        1. For each task, clone the meta-parameters into a dict of
+           differentiable tensors rooted at ``self.actor_critic.parameters()``.
+        2. Collect support rollout under ``torch.no_grad()``.
+        3. Compute the inner-loop loss (with gradients enabled) and step
+           the cloned parameters.  Depending on ``config.first_order``,
+           inner gradients are detached (FOMAML) or retained (full MAML).
+        4. Collect query rollout under ``torch.no_grad()`` using the
+           adapted parameters.
+        5. Compute the query (meta) loss.  Gradients flow back through
+           the adapted parameters to the original meta-parameters.
+        6. After accumulating across all tasks, call
+           ``meta_loss.backward()`` and ``meta_optimizer.step()``.
+           
+        """
+        self.actor_critic.train()
+
+        if not isinstance(task_batch, TaskBatch):
+            task_batch = TaskBatch(task_batch)
+
+        # Whether to build the full second-order graph
+        create_inner_graph = not self.config.first_order
+
+        meta_loss        = torch.tensor(0.0, device=self.device)
+        all_pre_rewards  = []
+        all_post_rewards = []
+        all_ep_lengths   = []
+        all_entropies    = []
+        per_task_improvements: List[float] = []
+
+        for task_fn in task_batch:
+            env = task_fn() if callable(task_fn) else task_fn
+            try:
+                # ── Step 1: clone meta-params keeping graph connection ─────
+                # ``param.clone()`` creates a new tensor that is part of the
+                # same autograd graph as ``param`` (it is differentiable
+                # w.r.t. the original module weights).
+                params = OrderedDict(
+                    (name, param.clone())
+                    for name, param in self.actor_critic.named_parameters()
+                )
+
+                # ── Step 2: support rollout (no gradient) ─────────────────
+                support = self._collect_trajectories(
+                    env, params, self.config.num_trajectories_per_task
+                )
+
+                # ── Step 3: inner-loop update ──────────────────────────────
+                adapted = self._inner_loop_update(
+                    params, support, create_graph=create_inner_graph
+                )
+
+                # ── Step 4: query rollout with adapted params (no gradient) ─
+                query = self._collect_trajectories(
+                    env, adapted, self.config.num_trajectories_per_task
+                )
+
+                # ── Step 5: query (meta) loss — gradient must reach params ──
+                query_advantages, _ = self._compute_advantages(
+                    query["rewards"], query["values"], query["dones"]
+                )
+                task_loss = self._pg_loss(adapted, query, query_advantages)
+                meta_loss = meta_loss + task_loss / task_batch.size
+
+                # ── Metrics (no gradient needed) ───────────────────────────
+                pre_rew  = float(support["rewards"].sum()) / self.config.num_trajectories_per_task
+                post_rew = float(query["rewards"].sum())  / self.config.num_trajectories_per_task
+                all_pre_rewards.append(pre_rew)
+                all_post_rewards.append(post_rew)
+                per_task_improvements.append(post_rew - pre_rew)
+
+                ep_len = (len(support["rewards"]) + len(query["rewards"])) / (
+                    2.0 * self.config.num_trajectories_per_task
+                )
+                all_ep_lengths.append(ep_len)
+
+                # Entropy estimate (detached, for logging only)
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(query["obs_np"]).float().to(self.device)
+                    act_t = torch.from_numpy(query["actions_np"]).float().to(self.device)
+                    _, ent_t, _ = self._evaluate_actions(obs_t, act_t, adapted)
+                    all_entropies.append(ent_t.mean().item())
+
+            finally:
+                env.close()
+
+        # ── Step 6: meta-gradient update ──────────────────────────────────
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+
+        # Verify gradient arrived (helps with debugging; removed in production)
+        # assert any(p.grad is not None for p in self.actor_critic.parameters())
+
+        if self.config.max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(
+                self.actor_critic.parameters(),
+                self.config.max_grad_norm,
+            )
+
+        self.meta_optimizer.step()
+        self.total_meta_iterations += 1
+
+        return {
+            "meta_loss":                    meta_loss.item(),
+            "pre_adaptation_reward":        float(np.mean(all_pre_rewards)),
+            "post_adaptation_reward":       float(np.mean(all_post_rewards)),
+            "pre_adaptation_reward_std":    float(np.std(all_pre_rewards)),
+            "post_adaptation_reward_std":   float(np.std(all_post_rewards)),
+            "adaptation_improvement":       float(np.mean(per_task_improvements)),
+            "adaptation_improvement_median": float(np.median(per_task_improvements)),
+            "fraction_tasks_improved":      float(np.mean([i > 0 for i in per_task_improvements])),
+            "mean_episode_length":          float(np.mean(all_ep_lengths)),
+            "mean_entropy":                 float(np.mean(all_entropies)),
+            "total_env_steps":              self.total_env_steps,
+            "meta_iteration":               self.total_meta_iterations,
+            "per_task_improvements":        per_task_improvements,
+        }
+
+    # ------------------------------------------------------------------
+    # Public: evaluate_adaptation
+    # ------------------------------------------------------------------
+
+    def evaluate_adaptation(
+        self,
+        env:                  gym.Env,
+        num_adaptation_steps: Optional[List[int]] = None,
+        num_eval_episodes:    int = 5,
+    ) -> Dict[str, float]:
+        """Evaluate adaptation quality at several inner-step counts."""
+        if num_adaptation_steps is None:
+            num_adaptation_steps = [0, 1, 3, 5, 10]
+
+        results: Dict[str, float] = {}
+
+        for k in sorted(num_adaptation_steps):
+            # Fresh clone of meta-parameters for each k — independent measurement
+            params = OrderedDict(
+                (name, param.clone())
+                for name, param in self.actor_critic.named_parameters()
+            )
+
+            for _ in range(k):
+                rollout = self._collect_trajectories(
+                    env, params, self.config.num_trajectories_per_task
+                )
+                params = self._inner_loop_update(params, rollout, create_graph=False)
+
+            # Evaluate
+            rewards = []
+            for _ in range(num_eval_episodes):
+                obs_raw, _ = env.reset()
+                obs = self._flatten_obs(obs_raw)
+                ep_reward = 0.0
+                done = False
+                step = 0
+
+                while not done and step < self.config.max_episode_steps:
+                    obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+                    with torch.no_grad():
+                        action_t, _, _, _ = self._forward_with_params(obs_t, params)
+                    action_np = action_t.cpu().numpy().squeeze(0)
+                    next_raw, rew, term, trunc, _ = env.step(action_np)
+                    done = bool(term or trunc)
+                    ep_reward += rew
+                    obs = self._flatten_obs(next_raw)
+                    step += 1
+
+                rewards.append(ep_reward)
+
+            results[f"reward_at_step_{k}"] = float(np.mean(rewards))
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Public: save / load / get_adapted_policy
+    # ------------------------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Save a checkpoint to *path*."""
+        torch.save(
+            {
+                "actor_critic_state_dict":    self.actor_critic.state_dict(),
+                "meta_optimizer_state_dict":  self.meta_optimizer.state_dict(),
+                "total_meta_iterations":      self.total_meta_iterations,
+                "total_env_steps":            self.total_env_steps,
+                "config":                     self.config,
+            },
+            path,
+        )
+
+    def load(self, path: str) -> None:
+        """Load a checkpoint from *path*."""
+        # weights_only=False required because the checkpoint includes the
+        # MAMLConfig dataclass object (not just raw tensors).  The checkpoint
+        # is produced exclusively by MAML.save() in this codebase.
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.actor_critic.load_state_dict(checkpoint["actor_critic_state_dict"])
+        self.meta_optimizer.load_state_dict(checkpoint["meta_optimizer_state_dict"])
+        self.total_meta_iterations = checkpoint["total_meta_iterations"]
+        self.total_env_steps       = checkpoint["total_env_steps"]
+
+    def get_adapted_policy(
+        self,
+        env:       gym.Env,
+        num_steps: Optional[int] = None,
+    ) -> ActorCritic:
+        """Return a deep-copied ActorCritic loaded with adapted parameters."""
+        adapted_params  = self.adapt(env, num_steps)
+        adapted_network = copy.deepcopy(self.actor_critic)
+
+        state_dict = adapted_network.state_dict()
+        for name, param in adapted_params.items():
+            state_dict[name] = param.detach().cpu()
+        adapted_network.load_state_dict(state_dict)
+        return adapted_network
