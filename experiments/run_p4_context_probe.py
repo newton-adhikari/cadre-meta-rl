@@ -108,4 +108,70 @@ def collect_context_episodes(
     task_dist,
     seed_offset: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    pass
+    """Roll out the agent and collect (z, dynamics_params) pairs."""
+    n_per_split = max(1, n_episodes // len(dyn_splits))
+    z_list:     List[np.ndarray] = []
+    param_list: List[np.ndarray] = []
+
+    rng = np.random.RandomState(seed_offset + 100)
+
+    for split in dyn_splits:
+        for ep_idx in range(n_per_split):
+            # Sample fresh dynamics and task for this episode
+            dyn   = sample_dynamics(split, rng=rng)
+            task  = task_dist.sample()
+            task.config.dynamics = dyn
+            env   = task._default_env_fn()
+
+            try:
+                K         = agent.config.context_encoder_config.context_window
+                trans_buf = deque(maxlen=K)
+
+                obs_raw, _ = env.reset()
+                obs = agent._flatten_obs(obs_raw)
+                done  = False
+                step  = 0
+
+                while not done and step < MAX_EP_STEPS:
+                    with torch.no_grad():
+                        z_t  = agent._encode_context(trans_buf,
+                                dict(agent.encoder.named_parameters()))
+                        z_np = z_t.cpu().numpy().squeeze(0)
+                        p_obs = (np.concatenate([obs, z_np])
+                                 if agent.context_dim > 0 else obs)
+                        obs_t = torch.from_numpy(p_obs).float().unsqueeze(0).to(agent.device)
+                        act_t, _, _, _ = agent._forward_policy(
+                            obs_t,
+                            dict(agent.actor_critic.named_parameters()),
+                        )
+                    act_np = act_t.cpu().numpy().squeeze(0)
+                    next_raw, rew, term, trunc, _ = env.step(act_np)
+                    done = bool(term or trunc)
+                    next_obs = agent._flatten_obs(next_raw)
+                    trans_buf.append(
+                        agent._build_transition(obs, act_np, rew, next_obs)
+                    )
+                    obs = next_obs
+                    step += 1
+
+                # Record final z after full episode
+                with torch.no_grad():
+                    z_final = agent._encode_context(
+                        trans_buf,
+                        dict(agent.encoder.named_parameters()),
+                    )
+                z_list.append(z_final.cpu().numpy().squeeze(0))
+
+                # Record true dynamics params
+                params_vec = np.array(
+                    [getattr(dyn, p) for p in PROBE_PARAMS], dtype=np.float32
+                )
+                param_list.append(params_vec)
+
+            finally:
+                env.close()
+
+    z_array     = np.array(z_list,     dtype=np.float32)   # (N, d_z)
+    param_array = np.array(param_list, dtype=np.float32)   # (N, n_params)
+    return z_array, param_array
+
