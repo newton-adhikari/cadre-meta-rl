@@ -427,3 +427,120 @@ def plot_umap_colored(
     plt.close(fig)
     print(f"  UMAP figure → {out}")
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    args       = parse_args()
+    ckpt_dir   = Path(args.ckpt_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("P4: Context Identifiability Experiment")
+    print(f"  Seeds:       {args.seeds}")
+    print(f"  Episodes:    {args.n_episodes} per seed")
+    print(f"  Dyn splits:  {DYNAMICS_SPLITS}")
+    print(f"  Output:      {output_dir}")
+    print("=" * 60)
+
+    task_dist = GoalReachingDistribution(
+        GoalReachingDistributionConfig(max_episode_steps=MAX_EP_STEPS), seed=0
+    )
+
+    # Collect (z, params) across all seeds
+    all_z:      List[np.ndarray] = []
+    all_params: List[np.ndarray] = []
+
+    for seed in args.seeds:
+        ckpt = ckpt_dir / f"cadre_seed{seed}_best.pt"
+        if not ckpt.exists():
+            print(f"  [SKIP] cadre_seed{seed}_best.pt not found")
+            continue
+
+        agent = _make_cadre_agent("gru", seed, "cpu")
+        agent.load(str(ckpt))
+        print(f"\n  Collecting seed={seed} ({args.n_episodes} eps) ...")
+
+        z_seed, p_seed = collect_context_episodes(
+            agent, args.n_episodes, DYNAMICS_SPLITS, task_dist,
+            seed_offset=seed,
+        )
+        print(f"    z shape: {z_seed.shape}  params shape: {p_seed.shape}")
+        all_z.append(z_seed)
+        all_params.append(p_seed)
+
+    if not all_z:
+        print("No checkpoints found. Exiting.")
+        return
+
+    # Pool across seeds
+    z_pool = np.concatenate(all_z,      axis=0)
+    p_pool = np.concatenate(all_params, axis=0)
+    print(f"\n  Pooled: z={z_pool.shape}  params={p_pool.shape}")
+
+    # Save raw arrays for reproducibility
+    np.save(str(output_dir / "z_vectors.npy"),     z_pool)
+    np.save(str(output_dir / "param_matrix.npy"),  p_pool)
+    with open(output_dir / "param_names.json", "w") as f:
+        json.dump(PROBE_PARAMS, f)
+    print(f"  Raw arrays saved → {output_dir}")
+
+    # Fit linear probes
+    print("\n  Fitting linear probes (Ridge, 5-fold CV) ...")
+    probe_results = fit_linear_probes(z_pool, p_pool)
+
+    # Print results table
+    print()
+    print(f"  {'Parameter':<22}  {'R² (CV)':<10}  {'±SD':<8}  {'|Pearson r|':<12}  p-value")
+    print("  " + "─" * 65)
+    for param, res in probe_results.items():
+        r2   = res.get("r2_cv", 0)
+        std  = res.get("r2_std", 0)
+        r    = abs(res.get("pearson_r", 0))
+        p    = res.get("pearson_p", 1)
+        flag = "  ★" if r2 >= 0.10 else ""
+        print(f"  {param:<22}  {r2:.4f}    {std:.4f}   {r:.4f}       {p:.1e}{flag}")
+
+    # Save probe results
+    out_json = output_dir / "probe_results.json"
+    with open(out_json, "w") as f:
+        json.dump({k: {kk: float(vv) for kk, vv in v.items() if kk != "note"}
+                   for k, v in probe_results.items()}, f, indent=2)
+    print(f"\n  Probe results → {out_json}")
+
+    # Interpretability threshold
+    identifiable = [p for p, r in probe_results.items() if r.get("r2_cv", 0) >= 0.10]
+    print(f"\n  Parameters with R² ≥ 0.10: {identifiable if identifiable else 'none'}")
+
+    # Generate figures
+    print("\n  Generating figures ...")
+    plot_r2_bars(probe_results, output_dir / "fig6c_probe_r2.pdf",
+                 title="Context Identifiability (pooled across 5 seeds)")
+    plot_pca_colored(z_pool, p_pool, PROBE_PARAMS,
+                     output_dir, top_k=4, probe_results=probe_results)
+    if not args.skip_umap:
+        plot_umap_colored(z_pool, p_pool, PROBE_PARAMS,
+                          output_dir, probe_results=probe_results)
+    else:
+        print("  UMAP skipped (--skip-umap)")
+
+    # Summary verdict
+    print("\n" + "─" * 60)
+    n_ident = len(identifiable)
+    if n_ident >= 3:
+        print(f"  RESULT: Strong identifiability — {n_ident} params with R² ≥ 0.10")
+    elif n_ident >= 1:
+        print(f"  RESULT: Partial identifiability — {n_ident} param(s) with R² ≥ 0.10")
+        print("  Encoder extracts some dynamics signal but not all parameters.")
+        print("  Report as partial evidence; be precise about which params.")
+    else:
+        print("  RESULT: No identifiability — no param with R² ≥ 0.10")
+    print("─" * 60)
+    print(f"\n  P4 complete → {output_dir.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
