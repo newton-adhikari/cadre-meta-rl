@@ -220,3 +220,98 @@ def evaluate_at_budget(agent: CADRE, eval_tasks: list,
             env.close()
     return episodes
 
+
+def main():
+    args    = parse_args()
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    done_flag = out_dir / f".done_{args.method}_seed{args.seed}"
+    if done_flag.exists():
+        print(f"Already done: {args.method} seed={args.seed}"); return
+
+    print("=" * 60)
+    print(f"P3 Multi-task: {args.method.upper()}  seed={args.seed}")
+    print(f"  Tasks: goal-reaching + obstacle-avoidance")
+    print(f"  Iters: {args.num_iters}  Output: {out_dir}")
+    print("=" * 60)
+
+    # ── Build mixed distribution ──────────────────────────────────────────
+    gr_dist = GoalReachingDistribution(
+        GoalReachingDistributionConfig(max_episode_steps=MAX_EP_STEPS), seed=args.seed)
+    oa_dist = ObstacleAvoidanceDistribution(
+        ObstacleAvoidanceDistributionConfig(
+            max_episode_steps=MAX_EP_STEPS, num_obstacles_range=(2, 6),
+            include_goal=True), seed=args.seed)
+    mixed_dist = MixedTaskDistribution([(gr_dist, 1.0), (oa_dist, 1.0)], seed=args.seed)
+
+    # ── Agent ─────────────────────────────────────────────────────────────
+    enc_type    = "none" if args.method == "fomaml" else "gru"
+    inner_steps = 0     if args.method == "cadre_ctx" else 1
+    agent = make_cadre_agent(enc_type, inner_steps, args.seed, args.device)
+
+    best_ckpt = out_dir / f"{args.method}_seed{args.seed}_best.pt"
+    t0 = time.time()
+    train_agent(agent, mixed_dist, args.seed, args.num_iters,
+                label=args.method.upper(), save_best_to=str(best_ckpt))
+
+    agent.save(str(out_dir / f"{args.method}_seed{args.seed}.pt"))
+    print(f"  Training time: {(time.time()-t0)/60:.1f} min")
+
+    # Load best checkpoint
+    if best_ckpt.exists():
+        agent.load(str(best_ckpt))
+        print("  Loaded best checkpoint")
+
+    # ── Evaluate both task types ──────────────────────────────────────────
+    dyn_dist = DynamicsDistribution(split=DYNAMICS_SPLIT, seed=0)
+
+    for task_type, eval_dist in [("goal_reaching", gr_dist), ("obstacle_avoidance", oa_dist)]:
+        eval_tasks = get_fixed_test_tasks(eval_dist, dyn_dist, n=N_EVAL_TASKS, seed=0)
+        eps_by_budget = {}
+        print(f"\n  Evaluating {task_type} ({N_EVAL_TASKS} tasks × {N_EVAL_EPISODES} eps)...")
+
+        for budget in BUDGET_SCHEDULE:
+            t1 = time.time()
+            eps = evaluate_at_budget(
+                agent, eval_tasks, budget,
+                n_eval=N_EVAL_EPISODES, label=args.method,
+                seed=args.seed, dyn_split=DYNAMICS_SPLIT,
+            )
+            eps_by_budget[budget] = eps
+            sr = np.mean([e.success for e in eps])
+            cr = np.mean([e.collision for e in eps])
+            print(f"    budget={budget:5d} ({budget//MAX_EP_STEPS:2d} eps) | "
+                  f"SR={sr:.3f}  CR={cr:.3f}  ({time.time()-t1:.0f}s)")
+
+        # Save per-task-type
+        raw = out_dir / f"raw_{args.method}_seed{args.seed}_{task_type}_iid.jsonl"
+        with open(raw, "w") as f:
+            for b, el in eps_by_budget.items():
+                for ep in el:
+                    f.write(json.dumps({
+                        "method": args.method, "seed": args.seed, "budget": b,
+                        "task_type": task_type, "split": "iid",
+                        "success": ep.success, "collision": ep.collision,
+                        "n_steps": ep.n_steps, "final_dist": ep.final_dist,
+                        "total_reward": ep.total_reward, "task_id": ep.task_id,
+                    }) + "\n")
+
+        sm = compute_curve_metrics(eps_by_budget)
+        sm.update({"method": args.method, "seed": args.seed,
+                   "task_type": task_type, "split": "iid"})
+        sp = out_dir / f"metrics_{args.method}_seed{args.seed}_{task_type}_iid.json"
+        with open(sp, "w") as f:
+            json.dump({k: ("inf" if isinstance(v, float) and math.isinf(v) else v)
+                       for k, v in sm.items()}, f, indent=2)
+
+        agg  = aggregate_seeds([sm])
+        show = BUDGET_SCHEDULE[::max(1, len(BUDGET_SCHEDULE)//4)]
+        print("  " + format_summary_row(f"{args.method}[{task_type}]", agg, show))
+
+    done_flag.touch()
+    print(f"\nDONE: {args.method} seed={args.seed}  ({(time.time()-t0)/60:.1f} min total)")
+
+
+if __name__ == "__main__":
+    main()
