@@ -47,16 +47,31 @@ OUTDIR          = Path("results/p2_full")
 
 
 def parse_args():
-    pass
+    p = argparse.ArgumentParser()
+    p.add_argument("--seeds",  type=int, nargs="+", default=[7, 13, 42, 99, 1337])
+    p.add_argument("--splits", nargs="+", default=["train", "ood_dyn_extrap"])
+    p.add_argument("--output-dir", type=str, default=str(OUTDIR))
+    return p.parse_args()
 
 
 def collect_ep(env, pol_fn, max_steps=MAX_EP_STEPS):
-    # mock data
+    obs, info = env.reset()
+    if not isinstance(obs, np.ndarray):
+        obs = np.concatenate([v.flatten() for v in obs.values()])
+    tr = 0.0; col = False; ns = 0
+    for _ in range(max_steps):
+        act = pol_fn(obs)
+        obs, r, t, tr2, info = env.step(act)
+        if not isinstance(obs, np.ndarray):
+            obs = np.concatenate([v.flatten() for v in obs.values()])
+        tr += r; ns += 1
+        if info.get("collision", False): col = True
+        if t or tr2: break
     return EpisodeResult(
-        success=False,
-        collision=0, n_steps=0,
-        final_dist=0,
-        total_reward=0,
+        success=bool(info.get("is_success", False)),
+        collision=col, n_steps=ns,
+        final_dist=float(info.get("distance_to_goal", float("nan"))),
+        total_reward=tr,
     )
 
 
@@ -204,7 +219,20 @@ def eval_seed(seed: int, splits: list, out_dir: Path):
 
 
 def main():
-    pass
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    args = parse_args()
+    out_dir = Path(args.output_dir)
+
+    print("=" * 60)
+    print(f"PPO-FT eval-only  seeds={args.seeds}  splits={args.splits}")
+    print("=" * 60)
+
+    for seed in args.seeds:
+        eval_seed(seed, args.splits, out_dir)
+
+    print("\nAll eval jobs done.")
 
 
 if __name__ == "__main__":
