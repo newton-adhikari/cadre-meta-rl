@@ -1,0 +1,52 @@
+# PPO Goal-Reaching Experiment Configuration
+# ===========================================
+
+experiment:
+  name: ppo_goal_reaching
+  description: "Train PPO on goal-reaching task as baseline"
+  seed: 42
+  device: auto  # auto, cpu, cuda
+
+# Environment configuration
+env:
+  type: goal_reaching
+  use_ros2: false  # Set to true for Gazebo simulation
+  flat_obs: true
+  
+  # Override default env settings
+  max_episode_steps: 500
+  goal_threshold: 0.25
+  arena_size: 4.0
+
+# Algorithm configuration
+algo:
+  name: ppo
+  lr: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+  num_epochs: 10
+  batch_size: 64
+  num_steps: 2048
+  max_grad_norm: 0.5
+  
+  network:
+    hidden_sizes: [256, 256]
+    activation: tanh
+
+# Training configuration
+training:
+  total_timesteps: 1000000
+  eval_interval: 10000
+  save_interval: 50000
+  log_interval: 1
+  num_eval_episodes: 10
+
+# Logging
+logging:
+  log_dir: runs
+  use_tensorboard: true
+  save_checkpoints: true
+  save_final_model: true

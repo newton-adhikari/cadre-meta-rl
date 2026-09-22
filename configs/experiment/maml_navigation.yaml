@@ -1,0 +1,66 @@
+# MAML Navigation Experiment Configuration
+# =========================================
+
+experiment:
+  name: maml_navigation
+  description: "Train MAML for multi-task navigation adaptation"
+  seed: 42
+  device: auto
+
+# Task distribution configuration
+task_distribution:
+  # Types to include: goal_reaching, obstacle_avoidance, path_following
+  task_types:
+    - goal_reaching
+    - obstacle_avoidance
+  
+  # Goal-reaching distribution
+  goal_reaching:
+    goal_distance_range: [1.0, 3.0]
+    randomize_start: true
+  
+  # Obstacle avoidance distribution
+  obstacle_avoidance:
+    num_obstacles_range: [3, 8]
+    include_goal: true
+    goal_distance_range: [1.5, 3.5]
+  
+  # Train/test split
+  n_train_tasks: 100
+  n_test_tasks: 20
+
+# Algorithm configuration
+algo:
+  name: maml
+  meta_lr: 1.0e-3
+  inner_lr: 0.1
+  num_inner_steps: 1
+  meta_batch_size: 10
+  num_trajectories_per_task: 10
+  
+  gamma: 0.99
+  gae_lambda: 0.95
+  entropy_coef: 0.01
+  first_order: false
+  max_grad_norm: 0.5
+  
+  network:
+    hidden_sizes: [256, 256]
+    activation: tanh
+
+# Training configuration
+training:
+  num_meta_iterations: 500
+  eval_interval: 25
+  save_interval: 50
+  log_interval: 1
+  
+  # Evaluation settings
+  eval_adaptation_steps: [0, 1, 3, 5, 10]
+  num_eval_episodes: 5
+
+# Logging
+logging:
+  log_dir: runs
+  use_tensorboard: true
+  save_checkpoints: true
