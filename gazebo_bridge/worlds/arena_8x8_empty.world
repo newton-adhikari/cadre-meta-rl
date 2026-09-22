@@ -1,0 +1,61 @@
+<?xml version="1.0" ?>
+<!--
+  meta-rl-tb3 validation world: empty 8x8 m arena (walls at +/- 4 m).
+
+-->
+<sdf version="1.6">
+  <world name="arena_8x8_empty">
+
+    <include><uri>model://sun</uri></include>
+    <include><uri>model://ground_plane</uri></include>
+
+    <!-- gazebo_ros_state: exposes /gazebo/set_entity_state and
+         /gazebo/get_entity_state so the bridge can teleport the robot back to
+         the arena center between episodes (no per-episode relaunch). -->
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/gazebo</namespace>
+      </ros>
+      <update_rate>1.0</update_rate>
+    </plugin>
+
+    <!-- Arena walls: 4 thin boxes forming an 8x8 enclosure (walls at +/-4). -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 4 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>8 0.1 0.5</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>8 0.1 0.5</size></box></geometry></visual>
+      </link>
+    </model>
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -4 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>8 0.1 0.5</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>8 0.1 0.5</size></box></geometry></visual>
+      </link>
+    </model>
+    <model name="wall_east">
+      <static>true</static>
+      <pose>4 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 8 0.5</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 8 0.5</size></box></geometry></visual>
+      </link>
+    </model>
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-4 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="c"><geometry><box><size>0.1 8 0.5</size></box></geometry></collision>
+        <visual name="v"><geometry><box><size>0.1 8 0.5</size></box></geometry></visual>
+      </link>
+    </model>
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+  </world>
+</sdf>
