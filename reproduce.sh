@@ -80,3 +80,117 @@ print(f'  gymnasium  {gymnasium.__version__}')
 print(f'  scipy      {scipy.__version__}')
 print('  All dependencies OK')
 " || { echo "Environment check failed. Run: pip install -r requirements.txt"; exit 1; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — FOMAML (gradient-only, n=7 seeds)
+#          Seeds: base 5 + ext 2 = 7 total
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[1/8] FOMAML — gradient-only meta-RL (n=7 seeds)..."
+for seed in $BASE_SEEDS $EXT_SEEDS; do
+    done_flag="$OUTDIR/.done_fomaml_seed${seed}"
+    [[ -f "$done_flag" ]] && { echo "  [SKIP] fomaml seed=$seed"; continue; }
+    [[ $EVAL_ONLY -eq 1 ]] && continue
+    echo "  Training FOMAML seed=$seed ..."
+    python3 -u -W ignore experiments/run_p2_single_seed.py \
+        --method fomaml \
+        --seed "$seed" \
+        --num-iters "$NUM_ITERS" \
+        --output-dir "$OUTDIR" \
+        2>&1 | tee "$OUTDIR/fomaml_seed${seed}.log"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — CADRE full (context + gradient, n=7 seeds)
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[2/8] CADRE — context encoder + gradient step (n=7 seeds)..."
+for seed in $BASE_SEEDS $EXT_SEEDS; do
+    done_flag="$OUTDIR/.done_cadre_seed${seed}"
+    [[ -f "$done_flag" ]] && { echo "  [SKIP] cadre seed=$seed"; continue; }
+    [[ $EVAL_ONLY -eq 1 ]] && continue
+    echo "  Training CADRE seed=$seed ..."
+    python3 -u -W ignore experiments/run_p2_single_seed.py \
+        --method cadre \
+        --seed "$seed" \
+        --num-iters "$NUM_ITERS" \
+        --output-dir "$OUTDIR" \
+        2>&1 | tee "$OUTDIR/cadre_seed${seed}.log"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — CADRE-ctx ablation (encoder only, no gradient, n=7 seeds)
+#          This is the KEY ablation: isolates context from gradient step.
+#          Wilcoxon p=0.014 at n=7 vs FOMAML at SR@2ep.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[3/8] CADRE-ctx — encoder only, num_inner_steps=0 (n=7 seeds)..."
+for seed in $BASE_SEEDS $EXT_SEEDS; do
+    done_flag="$ABLDIR/.done_cadre_seed${seed}"
+    [[ -f "$done_flag" ]] && { echo "  [SKIP] cadre-ctx seed=$seed"; continue; }
+    [[ $EVAL_ONLY -eq 1 ]] && continue
+    echo "  Training CADRE-ctx seed=$seed ..."
+    python3 -u -W ignore experiments/run_p2_single_seed.py \
+        --method cadre \
+        --encoder-type gru \
+        --num-inner-steps 0 \
+        --seed "$seed" \
+        --num-iters "$NUM_ITERS" \
+        --output-dir "$ABLDIR" \
+        2>&1 | tee "$ABLDIR/cadre_ctx_seed${seed}.log"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — PPO-FT baseline (multi-task PPO + fine-tune, n=5 seeds)
+#          Uses eval_ppo_ft.py to avoid deepcopy/threading bug.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[4/8] PPO-FT — multi-task PPO + fine-tune (n=5 seeds)..."
+for seed in $PPO_SEEDS; do
+    done_iid="$OUTDIR/.done_ppo_ft_seed${seed}_iid"
+    done_ood="$OUTDIR/.done_ppo_ft_seed${seed}_ood"
+    if [[ -f "$done_iid" && -f "$done_ood" ]]; then
+        echo "  [SKIP] ppo_ft seed=$seed (both iid+ood done)"
+        continue
+    fi
+    if [[ $EVAL_ONLY -eq 0 ]]; then
+        # Check if checkpoint exists; train if not
+        ckpt="$OUTDIR/ppo_ft_seed${seed}.pt"
+        if [[ ! -f "$ckpt" ]]; then
+            echo "  Training PPO-FT seed=$seed ..."
+            # run_b2_ppo_ft.py trains then crashes on deepcopy eval — that's OK
+            # The checkpoint is saved before the crash
+            python3 -u -W ignore experiments/run_b2_ppo_ft.py \
+                --seed "$seed" \
+                --output-dir "$OUTDIR" \
+                2>&1 | tee "$OUTDIR/ppo_ft_seed${seed}_train.log" || true
+        fi
+    fi
+    # Evaluate with the fixed script (save/load, no deepcopy)
+    echo "  Evaluating PPO-FT seed=$seed ..."
+    python3 -u -W ignore experiments/eval_ppo_ft.py \
+        --seeds "$seed" \
+        --output-dir "$OUTDIR" \
+        2>&1 | tee "$OUTDIR/ppo_ft_seed${seed}_eval.log"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — Context identifiability probe (P4)
+#          Linear probes R² from z → dynamics params
+#          Produces Table IV and Figure 4.
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[5/8] Context identifiability probe (P4)..."
+PROBE_DONE="$OUTDIR/.done_context_probe"
+if [[ -f "$PROBE_DONE" ]]; then
+    echo "  [SKIP] context probe (already done)"
+else
+    python3 -u -W ignore experiments/run_p4_context_probe.py \
+        --seeds $BASE_SEEDS \
+        --n-episodes 300 \
+        --ckpt-dir "$ABLDIR" \
+        --output-dir "$OUTDIR/probe" \
+        --skip-umap \
+        2>&1 | tee "$OUTDIR/context_probe.log"
+    touch "$PROBE_DONE"
+fi
