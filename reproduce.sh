@@ -194,3 +194,203 @@ else
         2>&1 | tee "$OUTDIR/context_probe.log"
     touch "$PROBE_DONE"
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Multi-task extension (goal-reaching + obstacle avoidance, P3)
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[6/8] Multi-task extension: goal-reaching + obstacle avoidance (P3)..."
+
+
+LEGACY_P3DIR="results/p3_multitask"
+if [[ "$P3DIR" != "$LEGACY_P3DIR" && -d "$LEGACY_P3DIR" ]]; then
+    if ! ls "$P3DIR"/metrics_*_iid.json >/dev/null 2>&1 \
+       && ls "$LEGACY_P3DIR"/*.pt "$LEGACY_P3DIR"/metrics_*_iid.json >/dev/null 2>&1; then
+        echo "  [INFO] Found existing P3 data in $LEGACY_P3DIR — using it as P3DIR."
+        P3DIR="$LEGACY_P3DIR"
+    fi
+fi
+if [[ $RUN_P3 -eq 0 ]]; then
+    echo "  [SKIP] --no-p3 flag set"
+else
+    for method in cadre_ctx fomaml; do
+        for seed in $BASE_SEEDS; do
+            done_flag="$P3DIR/.done_${method}_seed${seed}"
+            [[ -f "$done_flag" ]] && { echo "  [SKIP] p3 $method seed=$seed"; continue; }
+            [[ $EVAL_ONLY -eq 1 ]] && continue
+            echo "  P3 $method seed=$seed ..."
+            python3 -u -W ignore experiments/run_p3_multitask.py \
+                --method "$method" \
+                --seed "$seed" \
+                --num-iters "$NUM_ITERS" \
+                --output-dir "$P3DIR" \
+                2>&1 | tee "$P3DIR/${method}_seed${seed}.log"
+        done
+    done
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — Aggregate all results and generate paper figures
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[7/8] Aggregating results and generating figures..."
+
+# Copy CADRE-ctx metrics to main OUTDIR with method=cadre_ctx
+echo "  Copying CADRE-ctx metrics → $OUTDIR..."
+python3 -W ignore -c "
+import json
+from pathlib import Path
+ABLDIR = Path('${ABLDIR}')
+OUTDIR = Path('${OUTDIR}')
+for f in ABLDIR.glob('metrics_cadre_seed*_*.json'):
+    d = json.loads(f.read_text())
+    d = {k:('inf' if v=='inf' else v) for k,v in d.items()}
+    d['method'] = 'cadre_ctx'
+    out = OUTDIR / f.name.replace('metrics_cadre_', 'metrics_cadre_ctx_')
+    if not out.exists():
+        out.write_text(json.dumps(d, indent=2))
+        print(f'  Copied {out.name}')
+" 2>/dev/null
+
+# Aggregate IID + OOD for all methods
+python3 -u -W ignore experiments/aggregate_p2_results.py \
+    --output-dir "$OUTDIR" \
+    --methods fomaml cadre cadre_ctx ppo_ft \
+    --partial --min-seeds 3 \
+    2>&1 | grep -v "AdroitHand\|gymnasium-robotics\|ROS2\|WARNING"
+
+# Aggregate P3 multi-task results (Table V) — writes p3_summary.json + prints table
+if [[ $RUN_P3 -eq 1 ]]; then
+    echo "  Aggregating P3 multi-task (Table V)..."
+    python3 -W ignore -c "
+import json, math, numpy as np
+from pathlib import Path
+P3DIR   = Path('${P3DIR}')
+SEEDS   = [int(s) for s in '${BASE_SEEDS}'.split()]
+METHODS = ['cadre_ctx', 'fomaml']
+BUDGETS = [0, 200, 400, 1000, 2000, 4000]
+summary = {}
+print('  === TABLE V: MULTI-TASK (GR + OA) ===')
+for task_type in ['goal_reaching', 'obstacle_avoidance']:
+    print(f'  {task_type.upper().replace(\"_\",\" \")}:')
+    summary[task_type] = {}
+    for method in METHODS:
+        srs = []
+        for s in SEEDS:
+            f = P3DIR / f'metrics_{method}_seed{s}_{task_type}_iid.json'
+            if f.exists():
+                d = json.loads(f.read_text())
+                srs.append([d.get(f'sr_at_{b}', float('nan')) for b in BUDGETS])
+        if srs:
+            arr   = np.array(srs)
+            means = np.nanmean(arr, 0).tolist()
+            stds  = np.nanstd(arr, 0).tolist()
+            summary[task_type][method] = {
+                'n': len(srs),
+                'budgets': BUDGETS,
+                'sr_mean': means,
+                'sr_std':  stds,
+            }
+            print(f'    {method} (n={len(srs)}): '
+                  f'SR@0={means[0]:.3f}±{stds[0]:.3f}  '
+                  f'SR@2ep={means[2]:.3f}±{stds[2]:.3f}')
+        else:
+            print(f'    {method}: no results found')
+out = P3DIR / 'p3_summary.json'
+out.write_text(json.dumps(summary, indent=2))
+print(f'  P3 summary → {out}')
+" 2>&1 | grep -v AdroitHand | grep -v gymnasium | grep -v ROS2 || \
+        echo "  [WARN] P3 aggregation produced no output (P3 may not have run)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — Statistical tests (Wilcoxon, Levene, Cohen d) and final figures
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "[8/8] Computing statistical tests and regenerating paper figures..."
+
+python3 -u -W ignore -c "
+import json, math, numpy as np
+from pathlib import Path
+from scipy import stats
+
+OUTDIR  = Path('${OUTDIR}')
+ABLDIR  = Path('${ABLDIR}')
+ALL7    = [7, 13, 42, 99, 1337, 2024, 2025]
+BUDGETS = [0, 200, 400, 1000, 2000, 4000]
+
+def load(p):
+    d = json.loads(p.read_text())
+    return {k:(math.inf if v=='inf' else v) for k,v in d.items()}
+
+def get(method, seed, split, b_key):
+    for d in [OUTDIR, ABLDIR]:
+        f = d / f'metrics_{method}_seed{seed}_{split}.json'
+        if f.exists(): return load(f).get(b_key, float('nan'))
+    return float('nan')
+
+print()
+print('='*60)
+print('STATISTICAL TESTS (Appendix B)')
+print('='*60)
+
+report_lines = []
+for b, label in [(0,'SR@0'), (400,'SR@2ep'), (1000,'SR@5ep')]:
+    key = f'sr_at_{b}'
+    ctx = np.array([x for x in [get(\"cadre_ctx\",s,\"iid\",key) for s in ALL7] if not math.isnan(x)])
+    fom = np.array([x for x in [get(\"fomaml\",s,\"iid\",key) for s in ALL7] if not math.isnan(x)])
+    n = min(len(ctx), len(fom))
+    if n < 3: continue
+    W, p  = stats.wilcoxon(ctx[:n], fom[:n], alternative='greater')
+    Fl,pl = stats.levene(ctx, fom)
+    d_val = (ctx.mean()-fom.mean()) / np.sqrt((ctx.std()**2+fom.std()**2)/2) if ctx.std()+fom.std()>0 else 0
+    sig = '*** p<0.05' if p<0.05 else '(not sig)'
+    line = (f'{label}: ctx={ctx.mean():.3f}±{ctx.std():.3f}  '
+            f'fom={fom.mean():.3f}±{fom.std():.3f}  '
+            f'W={W:.0f} p={p:.4f} {sig}  d={d_val:.2f}  '
+            f'Levene F={Fl:.2f} p={pl:.3f}')
+    print(f'  {line}')
+    report_lines.append(line)
+
+# Save report
+stats_file = OUTDIR / 'stats_report.txt'
+stats_file.write_text('\n'.join(['CADRE-ctx vs FOMAML IID Statistical Tests', '='*50] + report_lines))
+print(f'\n  Stats report → {stats_file}')
+" 2>&1 | grep -v AdroitHand | grep -v gymnasium | grep -v ROS2
+
+# Regenerate architecture figure
+echo "  Regenerating architecture figure..."
+python3 -u -W ignore docs/gen_arch_fig.py 2>&1 | grep -v AdroitHand | grep -v ROS2 || \
+    echo "  [WARN] Architecture figure generation failed — check docs/gen_arch_fig.py"
+
+# Regenerate adaptation curve figures from aggregated data
+echo "  Regenerating adaptation curve figures..."
+python3 -u -W ignore -c "
+import json, math, numpy as np, sys
+sys.path.insert(0,'.')
+from pathlib import Path
+from experiments.run_p2_adaptation_curves import plot_adaptation_curves
+
+OUTDIR = Path('${OUTDIR}')
+
+def load_agg(path):
+    if not path.exists(): return {}
+    d = json.loads(path.read_text())
+    return {k:{kk:(math.inf if vv=='inf' else vv) for kk,vv in v.items()} for k,v in d.items()}
+
+iid_agg = load_agg(OUTDIR / 'aggregated_metrics_iid.json')
+ood_agg = load_agg(OUTDIR / 'aggregated_metrics_ood.json')
+budgets = [0, 200, 400, 1000, 2000, 4000]
+
+if iid_agg:
+    plot_adaptation_curves(iid_agg, budgets,
+        save_path=OUTDIR/'fig_iid_curves.pdf',
+        title='IID Adaptation Curves (n=7)')
+    print('  fig_iid_curves.pdf')
+if ood_agg:
+    plot_adaptation_curves(ood_agg, budgets,
+        save_path=OUTDIR/'fig_ood_curves.pdf',
+        title='OOD Extrap Curves (n=7)')
+    print('  fig_ood_curves.pdf')
+" 2>&1 | grep -v AdroitHand | grep -v gymnasium | grep -v ROS2 || true
+
